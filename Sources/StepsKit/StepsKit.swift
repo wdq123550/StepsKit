@@ -7,6 +7,47 @@ import Observation
 import HealthKit
 import CoreMotion
 
+// MARK: - 公开 · 埋点事件
+
+/// 埋点事件
+public enum StepsKitEvent: Sendable {
+    /// 权限申请完成（CoreMotion 是否授权、HealthKit 申请是否成功）
+    case authorizationCompleted(coreMotionGranted: Bool, healthKitCompleted: Bool)
+    /// 开始监听
+    case monitoringStarted
+    /// 停止监听
+    case monitoringStopped
+    /// CoreMotion 不可用或出错，回退到 HealthKit 获取步数和距离
+    case fallbackToHealthKit
+    /// 跨天刷新触发
+    case dayChanged
+    /// 数据获取异常
+    case error(Error, context: String)
+}
+
+// MARK: - 公开 · 埋点协议
+/// 埋点协议
+@MainActor
+public protocol StepsKitTracker: AnyObject {
+    func stepsKit(_ manager: StepsManager, didEmit event: StepsKitEvent)
+}
+
+// MARK: - 公开 · 错误类型
+public enum StepsKitError: LocalizedError {
+    case noData
+    /// 尚未申请权限
+    case notAuthorized
+
+    public var errorDescription: String? {
+        switch self {
+        case .noData:
+            return "未获取到数据"
+        case .notAuthorized:
+            return "尚未申请权限，请先调用 requestAuthorization() 申请权限后再启动监听"
+        }
+    }
+}
+
 /// 健康数据管理器（单例）
 ///
 /// 提供今日步数、活动能量、步行跑步距离、锻炼时间的获取与实时监听。
@@ -84,6 +125,9 @@ public final class StepsManager {
     /// 是否正在监听
     public private(set) var isMonitoring = false
 
+    /// 埋点代理，外界实现 ``StepsKitTracker`` 协议后赋值即可接收事件
+    public weak var tracker: (any StepsKitTracker)?
+
     /// 金手指总开关（非持久化，App 重启后自动关闭，对外通过 StepsDebugView 操作）
     internal var isDebugOverrideEnabled = false
 
@@ -121,9 +165,26 @@ public extension StepsManager {
     /// CoreMotion 即使被用户拒绝也不影响后续 HealthKit 权限申请。
     /// 全部完成后在 UserDefaults 中记录标识，供 `startMonitoring()` 检查。
     func requestAuthorization() async throws {
-        try? await requestCoreMotionAuthorization()
-        try await requestHealthKitAuthorization()
+        var coreMotionGranted = false
+        do {
+            try await requestCoreMotionAuthorization()
+            coreMotionGranted = true
+        } catch {}
+
+        var healthKitCompleted = false
+        do {
+            try await requestHealthKitAuthorization()
+            healthKitCompleted = true
+        } catch {
+            tracker?.stepsKit(self, didEmit: .error(error, context: "requestHealthKitAuthorization"))
+            throw error
+        }
+
         UserDefaults.standard.set(true, forKey: Self.authorizationRequestedKey)
+        tracker?.stepsKit(self, didEmit: .authorizationCompleted(
+            coreMotionGranted: coreMotionGranted,
+            healthKitCompleted: healthKitCompleted
+        ))
     }
 
     /// 一键启动监听
@@ -145,6 +206,7 @@ public extension StepsManager {
         startHealthKitObservers()
         startDayChangeListeners()
         isMonitoring = true
+        tracker?.stepsKit(self, didEmit: .monitoringStarted)
     }
 
     /// 停止监听
@@ -158,6 +220,7 @@ public extension StepsManager {
         healthKitQueries.removeAll()
         useHealthKitForSteps = false
         stopDayChangeListeners()
+        tracker?.stepsKit(self, didEmit: .monitoringStopped)
     }
 }
 
@@ -186,21 +249,6 @@ internal extension StepsManager {
     }
 }
 
-// MARK: - 公开 · 错误类型
-public enum StepsKitError: LocalizedError {
-    case noData
-    /// 尚未申请权限
-    case notAuthorized
-
-    public var errorDescription: String? {
-        switch self {
-        case .noData:
-            return "未获取到数据"
-        case .notAuthorized:
-            return "尚未申请权限，请先调用 requestAuthorization() 申请权限后再启动监听"
-        }
-    }
-}
 
 // MARK: - 私有 · 权限申请
 private extension StepsManager {
@@ -303,6 +351,7 @@ private extension StepsManager {
         useHealthKitForSteps = true
         observeHealthKit(.stepCount, unit: .count())
         observeHealthKit(.distanceWalkingRunning, unit: .meter())
+        tracker?.stepsKit(self, didEmit: .fallbackToHealthKit)
     }
 
     // 启动 HealthKit 活动能量和锻炼时间的 Observer
@@ -376,6 +425,7 @@ private extension StepsManager {
         let newDay = Calendar.current.startOfDay(for: Date())
         guard newDay != currentDay else { return }
         currentDay = newDay
+        tracker?.stepsKit(self, didEmit: .dayChanged)
 
         todaySteps = 0
         todayActiveEnergy = 0
@@ -402,16 +452,21 @@ private extension StepsManager {
     func queryPedometerData() async throws -> CMPedometerData {
         let now = Date()
         let start = Calendar.current.startOfDay(for: now)
-        return try await withCheckedThrowingContinuation { continuation in
-            pedometer.queryPedometerData(from: start, to: now) { data, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else if let data {
-                    continuation.resume(returning: data)
-                } else {
-                    continuation.resume(throwing: StepsKitError.noData)
+        do {
+            return try await withCheckedThrowingContinuation { continuation in
+                pedometer.queryPedometerData(from: start, to: now) { data, error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else if let data {
+                        continuation.resume(returning: data)
+                    } else {
+                        continuation.resume(throwing: StepsKitError.noData)
+                    }
                 }
             }
+        } catch {
+            tracker?.stepsKit(self, didEmit: .error(error, context: "queryPedometerData"))
+            throw error
         }
     }
 
@@ -432,6 +487,7 @@ private extension StepsManager {
             let result = try await descriptor.result(for: healthStore)
             return result?.sumQuantity()?.doubleValue(for: unit) ?? 0
         } catch {
+            tracker?.stepsKit(self, didEmit: .error(error, context: "queryHealthKit(\(identifier))"))
             return 0
         }
     }
